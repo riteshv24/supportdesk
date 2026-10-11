@@ -1,0 +1,132 @@
+name: CI
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  merge_group:
+  workflow_call:
+permissions:
+  contents: read
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+defaults:
+  run:
+    shell: bash
+jobs:
+
+  backend:
+    name: API contracts (SQLite and PostgreSQL)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_DB: supportdesk_ci
+          POSTGRES_USER: ci
+          POSTGRES_PASSWORD: ci-only-disposable-password
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U ci -d supportdesk_ci"
+          --health-interval 5s --health-timeout 3s --health-retries 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Release guard regression tests
+        run: python3 scripts/test_release_validation.py
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: backend/requirements*.txt
+      - run: python -m pip install -r backend/requirements-dev.txt
+      - name: SQLite API contracts
+        working-directory: backend
+        run: python -m pytest -q --junitxml=../ci-artifacts/sqlite.xml
+      - name: PostgreSQL API contracts
+        working-directory: backend
+        env:
+          TEST_DATABASE_URL: postgresql+psycopg://ci:ci-only-disposable-password@127.0.0.1:5432/supportdesk_ci
+        run: python -m pytest -q --junitxml=../ci-artifacts/postgres.xml
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: api-test-results
+          path: ci-artifacts/*.xml
+          if-no-files-found: error
+          retention-days: 14
+  frontend:
+    name: Frontend typecheck and production build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci
+        working-directory: frontend
+      - run: npm run build
+        working-directory: frontend
+
+  containers:
+    name: Container integration
+    needs: [backend, frontend]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      CI_IMAGE_TAG: ${{ github.sha }}
+      COMPOSE_PROJECT_NAME: ci-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Build release images
+        run: |
+          docker build --label "org.opencontainers.image.revision=$GITHUB_SHA" -t "backend-ci:$GITHUB_SHA" backend
+          docker build --label "org.opencontainers.image.revision=$GITHUB_SHA" -t "frontend-ci:$GITHUB_SHA" frontend
+      - name: Start isolated integration stack
+        run: docker compose -f .github/compose.ci.yml up --detach --wait --wait-timeout 120
+      - name: Verify frontend and API in packaged images
+        env:
+          CI_CONTAINER_SMOKE: '1'
+        run: python3 scripts/ci_container_smoke.py
+      - name: Export the images that passed testing
+        run: |
+          mkdir -p ci-artifacts
+          docker save "backend-ci:$GITHUB_SHA" "frontend-ci:$GITHUB_SHA" | gzip > ci-artifacts/images.tar.gz
+          cd ci-artifacts
+          sha256sum images.tar.gz > SHA256SUMS
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: container-${{ github.sha }}
+          path: |
+            ci-artifacts/images.tar.gz
+            ci-artifacts/SHA256SUMS
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+      - name: Show container logs
+        if: failure()
+        run: docker compose -f .github/compose.ci.yml logs --no-color
+      - name: Remove disposable stack and data
+        if: always()
+        run: docker compose -f .github/compose.ci.yml down --volumes --remove-orphans
+  gate:
+    name: CI gate
+    if: always()
+    needs: [backend, frontend, containers]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    steps:
+      - name: Require every check to succeed
+        env:
+          ALL_PASSED: ${{ needs.backend.result == 'success' && needs.frontend.result == 'success' && needs.containers.result == 'success' }}
+        run: test "$ALL_PASSED" = true
