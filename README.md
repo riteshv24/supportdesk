@@ -248,3 +248,7 @@ Read and run the implementation before presenting it in an interview. Add your o
 ## License
 
 MIT. See [LICENSE](LICENSE).
+
+## Pull requests and releases
+
+Changes are checked by GitHub Actions before release. See [the release guide](docs/RELEASING.md) for PR checks, required repository settings, tested container images, and deployment setup.
